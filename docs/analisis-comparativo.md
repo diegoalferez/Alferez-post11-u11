@@ -61,3 +61,30 @@ Desde el punto de vista arquitectónico, la GPU lidera en throughput absoluto po
 
 **Escenario (b): inferencia en el borde (smartphone, cámara industrial, vehículo).** Una H100 de 700 W y una U55C de 115 W exceden el presupuesto térmico de estos dispositivos, y la U55C es una tarjeta de centro de datos. La opción natural es la NPU integrada en el SoC, cuyo costo marginal es casi nulo; la FPGA solo se justifica cuando el requisito es latencia determinística. Este análisis no cubre FPGA de borde de menor potencia, que serían las candidatas realistas en una cámara industrial.
 
+## 4. Recomendación fundamentada por perfil
+
+**Perfil A: laboratorio universitario, USD 10 000, visión y NLP hasta 7B parámetros.** Se recomienda alquilar GPU NVIDIA en la nube (H100 o A100) en lugar de comprar hardware. Los criterios son: (1) *presupuesto*: USD 10 000 no alcanzan para una H100 (USD 25 000–40 000) pero financian unas 3 700 horas de H100 a USD 2,69/h; (2) *memoria*: un modelo de 7B en FP16 ocupa unos 14 GB y el ajuste fino necesita de 3 a 4 veces más (hasta unos 56 GB), que caben en los 80 GB de una H100 (Codesota, 2026); (3) *ecosistema*: CUDA y PyTorch cubren visión y NLP sin portar código, a diferencia de XLA en TPU o Core ML en Apple. Limitaciones: no hay propiedad del hardware, el costo escala con el uso y un Mac Studio M3 Ultra (desde USD 3 999) sería una alternativa local viable para inferencia, aunque sin CUDA.
+
+**Perfil B: manufactura, inspección visual en tiempo real (<5 ms), 50 líneas.** Se recomienda una FPGA por línea si la inspección gobierna el rechazo de piezas con implicaciones de seguridad, y una GPU centralizada con redundancia si el control de calidad no es crítico para la seguridad. El razonamiento detallado está en las decisiones técnicas de las secciones 6 y 7.
+
+**Perfil C: proveedor en la nube, modelos de 70B en clústeres de 512 aceleradores con comunicación colectiva intensiva.** Se recomienda GPU NVIDIA H100/H200 en clústeres con NVLink e InfiniBand. Los criterios son: (1) *interconexión*: 900 GB/s por GPU de NVLink 4.0 dentro del nodo (NVIDIA, s. f.), crítica para los *all-reduce* del entrenamiento; (2) *ecosistema y demanda*: un proveedor que revende capacidad debe ofrecer el software que sus clientes ya usan, CUDA y NCCL; (3) *flexibilidad*: la misma flota sirve entrenamiento e inferencia. Limitaciones: 512 GPU a 700 W suponen unos 358 kW solo en aceleradores (cálculo del autor), una inversión de unos USD 15,4 millones a USD 30 000 por GPU sin red ni servidores, y plazos de entrega de 6 a 12 meses en compras grandes (GMI Cloud, 2026). La TPU es competitiva, pues Google reporta 99 % de eficiencia de escalado en entrenamiento con Trillium (Google Cloud, 2024), pero solo se obtiene alquilándola a Google, lo que no sirve a un proveedor que quiere ser dueño de su infraestructura.
+
+## 5. Cuantización INT8 frente a FP32: efecto en throughput y precisión
+
+El throughput de los Tensor Cores se duplica al pasar de FP16/BF16 a INT8 en la misma GPU: la A100 entrega 312 TFLOPS en FP16 y 624 TOPS en INT8 (NVIDIA, 2021), y la H100 989 TFLOPS frente a 1 979 TOPS en modo denso (NVIDIA, s. f.). Wu et al. (2020) muestran el mismo patrón en la arquitectura Turing: respecto a FP32, FP16 logra 8× de throughput matemático e INT8 16×, es decir, el doble que FP16. La ganancia no es una cifra de un solo modelo de GPU, sino una propiedad de la aritmética entera de los Tensor Cores.
+
+| Configuración | Throughput relativo | Modelo | Exactitud reportada | Fuente |
+|---|---|---|---|---|
+| FP32 (referencia) | 1× | ResNet-50 v1.5 | 76,16 % top-1 (checkpoint de Wu et al.); 76,46 % en MLPerf | Wu et al. (2020); Dell Technologies (2024) |
+| INT8, PTQ calibrado con entropía | ~2× vs FP16 (Tensor Core) | ResNet-50 v1.5 | 76,05 % (−0,14 %) | Wu et al. (2020) |
+| INT8, QAT | ~2× vs FP16 (Tensor Core) | ResNet-50 v1.5 | 76,85 % (+0,91 %) | Wu et al. (2020) |
+| FP32 (referencia) | 1× | BERT-Large (SQuAD v1.1) | F1 = 91,01 (checkpoint de Wu et al.); 90,874 en MLPerf | Wu et al. (2020); Dell Technologies (2021) |
+| INT8, PTQ con calibración *max* | ~2× vs FP16 (Tensor Core) | BERT-Large | F1 = 85,92 | Wu et al. (2020) |
+| INT8, PTQ con calibración *entropy* | ~2× vs FP16 (Tensor Core) | BERT-Large | F1 = 37,40 | Wu et al. (2020) |
+| INT8, PTQ con mejor calibración (percentil 99,999) | ~2× vs FP16 (Tensor Core) | BERT-Large | F1 = 90,20 (−0,89 %) | Wu et al. (2020) |
+| INT8, QAT | ~2× vs FP16 (Tensor Core) | BERT-Large | F1 = 90,67 (−0,37 %) | Wu et al. (2020) |
+
+**La cuantización no es un simple *cast*.** Los resultados de BERT-Large lo demuestran: con una calibración inadecuada la exactitud cae de F1 = 91,01 a 85,92 (*max*) o incluso a 37,40 (*entropy*), mientras que una calibración por percentil la recupera a 90,20 y el entrenamiento consciente de la cuantización (QAT) a 90,67. En ResNet-50 el efecto es mucho menor (−0,14 % con PTQ), lo que muestra que la sensibilidad depende de la arquitectura: en el mismo estudio, EfficientNet-b0 pierde 6,23 % con PTQ y solo se recupera con QAT. Wu et al. (2020) recomiendan pesos con cuantización por canal y calibración *max*, activaciones con calibración elegida entre varias, y recurrir a cuantización parcial o QAT cuando la exactitud no alcanza.
+
+**Restricción de exactitud de MLPerf.** MLPerf exige que un envío cuantizado conserve al menos 99 % de la exactitud FP32 de referencia en ResNet-50 (76,46 % × 0,99 ≈ 75,70 %), y 99 % o 99,9 % en BERT-Large (F1 de 89,97 o de 90,78 sobre 90,874; cálculo del autor sobre la referencia de MLPerf). Con esas reglas, ResNet-50 en INT8 pasa con holgura incluso con PTQ; BERT-Large pasa el umbral de 99 % solo con la mejor calibración o con QAT, y los 90,20 y 90,67 de Wu et al. (2020) quedan por debajo del umbral de 99,9 %. Las referencias de Wu et al. (F1 = 91,01) y de MLPerf (90,874) usan checkpoints distintos, de modo que la comparación solo ilustra el orden de magnitud. Por eso las cifras de TOPS de un fabricante son un techo teórico y no una promesa de rendimiento con exactitud preservada.
+
