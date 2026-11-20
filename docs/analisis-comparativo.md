@@ -88,3 +88,66 @@ El throughput de los Tensor Cores se duplica al pasar de FP16/BF16 a INT8 en la 
 
 **Restricción de exactitud de MLPerf.** MLPerf exige que un envío cuantizado conserve al menos 99 % de la exactitud FP32 de referencia en ResNet-50 (76,46 % × 0,99 ≈ 75,70 %), y 99 % o 99,9 % en BERT-Large (F1 de 89,97 o de 90,78 sobre 90,874; cálculo del autor sobre la referencia de MLPerf). Con esas reglas, ResNet-50 en INT8 pasa con holgura incluso con PTQ; BERT-Large pasa el umbral de 99 % solo con la mejor calibración o con QAT, y los 90,20 y 90,67 de Wu et al. (2020) quedan por debajo del umbral de 99,9 %. Las referencias de Wu et al. (F1 = 91,01) y de MLPerf (90,874) usan checkpoints distintos, de modo que la comparación solo ilustra el orden de magnitud. Por eso las cifras de TOPS de un fabricante son un techo teórico y no una promesa de rendimiento con exactitud preservada.
 
+## 6. Decisión técnica: ¿GPU centralizada o FPGA distribuida para el Perfil B según latencia y TCO?
+
+El Perfil B exige una latencia menor a 5 ms en 50 líneas con, por ejemplo, 10 imágenes por segundo cada una, esto es, 500 imágenes por segundo en total. El throughput no es el problema: la referencia de MLPerf para una H100/H200 es de unas 79 000 consultas por segundo en ResNet-50 con un límite de latencia de 15 ms por GPU, y de unas 94 600 muestras por segundo en Offline (sección 2), de modo que 500 imágenes por segundo equivalen a menos del 1 % de esa capacidad. Aun así, conviene no confundir latencia con throughput: si la inferencia con batch=1 tarda 1–2 ms y se ejecutara en un único flujo serial, 500 imágenes por segundo ocuparían entre 25 % y 100 % del tiempo de la GPU y las colas inflarían la latencia; por eso la GPU centralizada necesitaría varios streams concurrentes o instancias MIG (hasta 7 por GPU según NVIDIA, s. f.) o un batch pequeño, y en ese caso sí cabe en el presupuesto de latencia promedio.
+
+En capital, 50 FPGA Alveo U55C cuestan entre unos USD 237 000 (a USD 4 747 cada una, precio de AMD) y USD 400 000 (a USD 8 000, valor de la guía), frente a unos USD 25 000–40 000 de una sola H100 más su servidor anfitrión; la solución centralizada es entre 6 y 16 veces más barata en adquisición, aunque ambos cálculos omiten servidores y red. A esos precios, duplicar la GPU para tener redundancia sigue costando una fracción del despliegue FPGA. La centralización introduce un punto único de falla (si cae el servidor, las 50 líneas pierden inspección a la vez), contención entre líneas en momentos de pico y jitter del sistema operativo y del planificador de CUDA; además, el trayecto de red desde cada cámara consume parte de los 5 ms.
+
+Una FPGA fija la lógica en hardware, sin sistema operativo ni controladores, por lo que garantiza una latencia máxima determinística; el valor de menos de 1 ms proviene de la guía y no se verificó en las fuentes consultadas. Si el sistema de rechazo tiene implicaciones de seguridad industrial, que exige una garantía de latencia en el peor caso y no solo en promedio, se debe preferir la FPGA distribuida aunque cueste más: el sobrecosto compra aislamiento de fallos y latencia acotada. Si el control es de calidad no crítico para la seguridad y el costo es la restricción dominante, la GPU centralizada con servidor redundante es una alternativa razonable.
+
+## 7. Decisión técnica: ¿conviene cuantizar a INT8 el modelo de inspección visual del Perfil B?
+
+Aunque el modelo ya cumpla el presupuesto de 5 ms en FP16, cuantizarlo a INT8 aporta un beneficio práctico más allá de ser más rápido: libera margen de capacidad. Como INT8 duplica aproximadamente el throughput de los Tensor Cores (sección 5), el mismo hardware puede atender más líneas de producción, o la misma carga con mayor holgura de cola, sin degradar la latencia individual, lo cual es valioso ante una expansión de las 50 líneas o para absorber picos.
+
+El riesgo está en la exactitud. Una caída de menos de un punto en la métrica agregada, como la de ResNet-50 en Wu et al. (2020), no garantiza que la clase "defecto" se preserve: esa clase suele ser minoritaria y más sensible al ruido de cuantización que las mayoritarias, y el mismo estudio muestra que el efecto varía mucho entre arquitecturas (de −0,14 % en ResNet-50 a −6,23 % en EfficientNet-b0 con PTQ) y entre calibraciones (de F1 = 37,40 a 90,20 en BERT-Large). En detección de defectos un falso negativo, una pieza defectuosa clasificada como buena, cuesta mucho más que un falso positivo, que solo genera una revisión manual. Por eso el top-1 general es insuficiente: el equipo debe exigir una validación específica de precisión y recall sobre la clase de defecto, con un conjunto de calibración que incluya ejemplos de defectos y un margen de no inferioridad en el recall definido de antemano.
+
+Se recomienda cuantizar a INT8 solo si esa validación confirma que el recall sobre piezas defectuosas no se degrada de forma significativa respecto a FP16, recurriendo a calibración alternativa, cuantización parcial o QAT si hace falta. Si no se cumple, se conserva FP16, que ya satisface la latencia: el costo de un falso negativo supera el beneficio del margen de throughput.
+
+## Conclusiones
+
+Ningún acelerador es óptimo en todos los criterios. La GPU ofrece el mayor throughput, el ecosistema más amplio y la mejor interconexión para entrenamiento a gran escala; la TPU, el menor costo por hora con compromiso para quien ya trabaja en JAX o TensorFlow; la NPU, eficiencia en el dispositivo a costo marginal casi nulo; y la FPGA, latencia determinística a cambio de capital y esfuerzo de desarrollo. Los datos de MLPerf v4.1 muestran un liderazgo claro de la GPU en las pruebas donde hay resultados comparables, pero también que la cobertura de TPU, NPU y FPGA es parcial. La cuantización INT8 duplica el throughput de los Tensor Cores, aunque exige calibración y validación específica: una conversión ingenua puede destruir la exactitud (F1 de 37,40 en BERT-Large). Las recomendaciones por perfil se derivan de esos criterios, con un componente de costo que depende de supuestos explícitos, y que debería recalcularse con precios y rondas MLPerf más recientes antes de una decisión de compra.
+
+## Referencias
+
+9to5Mac. (2025). *Apple launches new Mac Studio with M4 Max and M3 Ultra configs*. https://9to5mac.com/2025/03/05/apple-launches-new-mac-studio-with-m4-max-and-m3-ultra-configs-more/
+
+AMD. (s. f.). *Alveo U55C data center accelerator card (A-U55C-P00G-PQ-G)*. https://www.amd.com/en/products/accelerators/alveo/u55c/a-u55c-p00g-pq-g.html
+
+AMD. (2023). *Alveo U55C data center accelerator cards data sheet (DS978, v1.3)*. https://docs.amd.com/r/en-US/ds978-u55c/Summary
+
+Dell Technologies. (2021, 21 de junio). *Deep learning performance with MLPerf Inference v0.7 benchmark*. Dell InfoHub. https://infohub.delltechnologies.com/p/deep-learning-performance-with-mlperf-inference-v0-7-benchmark/
+
+Dell Technologies. (2024, 11 de enero). *MLPerf Inference 3.1 on Dell PowerEdge Server with Intel 4th Generation Xeon CPU*. Dell InfoHub. https://infohub.delltechnologies.com/p/mlperf-tm-inference-3-1-on-dell-poweredge-server-with-intel-r-4th-generation-xeon-r-cpu
+
+Codesota. (2026, 22 de abril). *NVIDIA H100 SXM*. https://www.codesota.com/hardware/h100
+
+EE Times Japan. (2024, 2 de septiembre). 推論性能でNVIDIAに挑む AIチップは「省エネ」が競争の軸に: 「MLPerf」の最新スコアを公開. https://eetimes.itmedia.co.jp/ee/articles/2409/02/news099_4.html
+
+GMI Cloud. (2026). *2026 cost of renting or buying NVIDIA H100 GPUs for data centers*. https://www.gmicloud.ai/en/blog/2026-cost-of-renting-or-uying-nvidia-h100-gpus-for-data-centers
+
+Google Cloud. (s. f.-a). *TPU v5e*. Cloud TPU documentation. https://cloud.google.com/tpu/docs/v5e
+
+Google Cloud. (s. f.-b). *Cloud TPU pricing*. https://cloud.google.com/tpu/pricing
+
+Google Cloud. (2024). *Trillium TPU is GA*. Google Cloud Blog. https://cloud.google.com/blog/products/compute/trillium-tpu-is-ga
+
+Google Cloud. (2025). *AI Hypercomputer inference updates for Google Cloud TPU and GPU*. Google Cloud Blog. https://cloud.google.com/blog/products/compute/ai-hypercomputer-inference-updates-for-google-cloud-tpu-and-gpu
+
+IntuitionLabs. (2026). *Data center GPU prices: Costs, configs and price history*. https://intuitionlabs.ai/articles/data-center-gpu-prices
+
+MacRumors. (2025, 5 de marzo). *A maxed out M3 Ultra Mac Studio will cost you $14,099*. https://www.macrumors.com/2025/03/05/MAXED-OUT-M3-ULTRA-MAC-STUDIO-14099/
+
+MacStories. (2025). *Apple reveals new Mac Studio powered by M4 Max and M3 Ultra*. https://www.macstories.net/news/apple-reveals-new-mac-studio-powered-by-m4-max-and-m3-ultra/
+
+NVIDIA. (s. f.). *NVIDIA H100 Tensor Core GPU*. https://www.nvidia.com/en-us/data-center/h100/
+
+NVIDIA. (2021). *NVIDIA A100 Tensor Core GPU datasheet*. https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/a100-80gb-datasheet-update-a4-nvidia-1485612-r12-web.pdf
+
+NVIDIA. (2024, 28 de agosto). *NVIDIA Blackwell platform sets new LLM inference records in MLPerf Inference v4.1*. NVIDIA Technical Blog. https://developer.nvidia.com/blog/nvidia-blackwell-platform-sets-new-llm-inference-records-in-mlperf-inference-v4-1
+
+Tech Insider. (2026). *What renting an NVIDIA H100 costs per hour in 2026 and when renting beats buying*. https://tech-insider.org/what-renting-an-nvidia-h100-costs-per-hour-in-2026-and-when-renting-beats-buying/
+
+Wu, H., Judd, P., Zhang, X., Isaev, M., & Micikevicius, P. (2020). *Integer quantization for deep learning inference: Principles and empirical evaluation*. arXiv. https://doi.org/10.48550/arXiv.2004.09602
+
+xpu.pub. (2024, 20 de septiembre). *MLPerf reveals Blackwell gains, Untether's power efficiency*. https://xpu.pub/2024/09/20/mlperf-4-1/
