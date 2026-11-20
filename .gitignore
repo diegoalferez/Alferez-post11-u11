@@ -1,0 +1,7 @@
+# Binarios compilados
+vectorAdd
+matMul
+vectorAddStream
+vas_*
+*.o
+*.exe
